@@ -1,0 +1,437 @@
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpConfig.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpConfig.kt
+index d9969a1f61362f40195a57bd15171dce8c26aaf4..bac80ff97894184a191b80c86523942eb59449aa 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpConfig.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpConfig.kt
+@@ -12,6 +12,21 @@ data class McpCommonOptions(
+     val headers: List<Pair<String, String>> = emptyList(),
+     val tools: List<McpTool> = emptyList(),
+     val oauth: McpOAuthState? = null,
++    /**
++     * 是否为 Ombre-Brain 类记忆服务注入「对话写入上下文」。
++     *
++     * 开启后，本 Server 的已支持幂等治理的写入工具（hold/grow）在调用时
++     * 会自动带上 client_write_context（conversation_id + anchor_node_id +
++     * generation_id），供 Ombre-Brain 识别同一用户消息的 reroll 重试并做
++     * 幂等去重，避免记忆库堆积重复桶。
++     *
++     * plan 与 letter_write 暂未接入服务端 receipt 账本，故不会注入；待其
++     * 各自的幂等语义、复用返回和测试就绪后再单独加入。
++     *
++     * 默认关闭：不凭显示名/URL 猜，必须由用户在 MCP Server 配置中显式开启，
++     * 避免误注入到非 Ombre 的普通 MCP Server。
++     */
++    val memoryWriteContextInjection: Boolean = false,
+ )
+ 
+ /**
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/MemoryWriteContext.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/MemoryWriteContext.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..96c8fa601133f5ebb6f0538919c5ab03d14c37f7
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/MemoryWriteContext.kt
+@@ -0,0 +1,148 @@
++package me.rerere.rikkahub.data.ai.mcp
++
++import kotlinx.serialization.json.JsonObject
++import kotlinx.serialization.json.JsonPrimitive
++import kotlinx.serialization.json.buildJsonObject
++import kotlinx.serialization.json.put
++import me.rerere.ai.core.MessageRole
++import me.rerere.rikkahub.data.model.Conversation
++import kotlin.uuid.Uuid
++
++/**
++ * RikkaHub 以「单条对话为截止点重 roll」时，上一次分支已成功执行的
++ * hold/grow 在 Ombre-Brain 里是永久副作用；重新生成又会写一份，导致
++ * 记忆库出现大量重复桶。
++ *
++ * 这个模块负责给 Ombre-Brain 的写入型工具注入稳定对话锚点：
++ *
++ *     client_write_context = {
++ *         "client": "rikkahub",
++ *         "conversation_id": "<conversation UUID>",
++ *         "anchor_node_id": "<触发本次生成的稳定用户消息节点 UUID>",
++ *         "generation_id": "<本次生成动作 UUID，审计用>",
++ *         "reroll_generation": 0-based 的第几次生成
++ *     }
++ *
++ * Ombre-Brain 服务端用 (conversation_id, anchor_node_id) 建立持久化写入
++ * 幂等账本：同锚点同 payload 复用首次结果，措辞不同但事实相同的 reroll
++ * 复用既有桶，从而不再堆积重复记忆。
++ *
++ * 设计要点：
++ * - 只对已由 Ombre-Brain 实现 receipt 幂等语义的写入工具（hold / grow）
++ *   注入；plan / letter_write 的幂等语义尚未实现，不能只在客户端注入。
++ *   读工具（breath、pulse 等）不注入，避免无意义的参数噪音。
++ * - 注入采用「强制覆盖」：即使模型自己传了 client_write_context，也以
++ *   客户端计算的值为准，不信任模型生成的内容。
++ * - 没有 client_write_context 的调用方（其他 MCP 客户端）在服务端
++ *   完全走旧行为，不受影响。
++ */
++data class MemoryWriteContext(
++    val client: String,
++    val conversationId: String,
++    val anchorNodeId: String,
++    val generationId: String,
++    val rerollGeneration: Int,
++)
++
++/**
++ * 判断一个 MCP server 是否应注入写入上下文。
++ *
++ * 不再使用显示名/URL 启发式（可能误注入到非 Ombre 的 server）——
++ * 必须由用户在 MCP Server 配置中显式开启 memoryWriteContextInjection。
++ */
++private val MEMORY_WRITE_TOOLS = setOf("hold", "grow")
++
++/**
++ * 计算当前这次生成对应的稳定锚点。
++ *
++ * 锚点规则（与 reroll 语义一一对应）：
++ * 1. 用户消息处 reroll：会话已截断到该用户消息节点，锚点 = 该节点。
++ * 2. assistant 消息处 reroll：messageRange 截掉该 assistant 消息，
++ *    锚点 = 范围内最后一个 USER 消息节点。
++ * 3. 普通发消息：锚点 = 新追加的用户消息节点（也是范围内最后一个 USER）。
++ * 4. 异常情况（没有 USER 节点）：返回 null，调用方降级为不注入。
++ */
++fun resolveAnchorNodeId(
++    conversation: Conversation,
++    messageRange: ClosedRange<Int>?,
++): Uuid? {
++    val nodes = conversation.messageNodes
++    if (nodes.isEmpty()) return null
++
++    val end = (messageRange?.endInclusive?.plus(1))?.coerceIn(0, nodes.size) ?: nodes.size
++    val start = messageRange?.start?.coerceIn(0, end) ?: 0
++    if (start >= end) return null
++
++    return nodes.subList(start, end)
++        .lastOrNull { node -> node.role == MessageRole.USER }
++        ?.id
++}
++
++/**
++ * 计算 reroll 代数（0-based）。
++ *
++ * assistant 消息节点的 messages 长度 = 该节点已有分支数；本次生成将再
++ * 追加一条，所以本次是第 (size) 次生成，0-based 为 size - 1。
++ * 用户消息节点几乎不会 reroll，正常/用户消息 reroll 场景记为 0。
++ */
++fun resolveRerollGeneration(
++    conversation: Conversation,
++    messageRange: ClosedRange<Int>?,
++): Int {
++    if (messageRange == null) return 0
++    // assistant reroll 时 messageRange 截到该 assistant 消息之前
++    // （0 until nodeIndex），目标 assistant 节点在 endInclusive + 1。
++    val targetIndex = messageRange.endInclusive + 1
++    val node = conversation.messageNodes.getOrNull(targetIndex) ?: return 0
++    if (node.role != MessageRole.ASSISTANT) return 0
++    return (node.messages.size - 1).coerceAtLeast(0)
++}
++
++/**
++ * 构造本次生成的 MemoryWriteContext；无法解析锚点时返回 null（不注入）。
++ */
++fun buildMemoryWriteContext(
++    conversation: Conversation,
++    messageRange: ClosedRange<Int>?,
++    generationId: Uuid = Uuid.random(),
++): MemoryWriteContext? {
++    val anchorNodeId = resolveAnchorNodeId(conversation, messageRange) ?: return null
++    return MemoryWriteContext(
++        client = "rikkahub",
++        conversationId = conversation.id.toString(),
++        anchorNodeId = anchorNodeId.toString(),
++        generationId = generationId.toString(),
++        rerollGeneration = resolveRerollGeneration(conversation, messageRange),
++    )
++}
++
++/**
++ * 在工具参数上注入 client_write_context（仅对开启注入的 Ombre-Brain
++ * 写入型工具）。
++ *
++ * 模型自己填写的同名参数会被强制覆盖 —— 锚点必须以客户端实际状态为准。
++ *
++ * @param injectionEnabled 该 MCP Server 是否显式开启注入
++ *   （McpCommonOptions.memoryWriteContextInjection）。默认 false，不凭
++ *   显示名/URL 猜测，避免误注入到非 Ombre 的普通 Server。
++ */
++fun injectMemoryWriteContext(
++    raw: JsonObject,
++    toolName: String,
++    context: MemoryWriteContext?,
++    injectionEnabled: Boolean,
++): JsonObject {
++    if (context == null) return raw
++    if (!injectionEnabled) return raw
++    if (toolName !in MEMORY_WRITE_TOOLS) return raw
++
++    val merged = raw.toMutableMap()
++    merged["client_write_context"] = buildJsonObject {
++        put("client", JsonPrimitive(context.client))
++        put("conversation_id", JsonPrimitive(context.conversationId))
++        put("anchor_node_id", JsonPrimitive(context.anchorNodeId))
++        put("generation_id", JsonPrimitive(context.generationId))
++        put("reroll_generation", JsonPrimitive(context.rerollGeneration))
++    }
++    return JsonObject(merged)
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/service/ChatService.kt b/app/src/main/java/me/rerere/rikkahub/service/ChatService.kt
+index 934b78aec85f523aece76901632cce320f5731e1..e0a372b5da2197fe9e59df58ebb4078dab5858d5 100644
+--- a/app/src/main/java/me/rerere/rikkahub/service/ChatService.kt
++++ b/app/src/main/java/me/rerere/rikkahub/service/ChatService.kt
+@@ -46,6 +46,8 @@ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.data.ai.GenerationChunk
+ import me.rerere.rikkahub.data.ai.GenerationHandler
+ import me.rerere.rikkahub.data.ai.mcp.McpManager
++import me.rerere.rikkahub.data.ai.mcp.buildMemoryWriteContext
++import me.rerere.rikkahub.data.ai.mcp.injectMemoryWriteContext
+ import me.rerere.rikkahub.data.ai.tools.createConversationTools
+ import me.rerere.rikkahub.data.ai.tools.local.LocalTools
+ import me.rerere.rikkahub.data.ai.tools.createSearchTools
+@@ -546,6 +548,15 @@ class ChatService(
+                             )
+                         )
+                     }
++                    // RikkaHub reroll 治理：为 Ombre-Brain 的写入型工具
++                    // 注入稳定对话锚点，让服务端能识别「同一条用户消息的
++                    // 重新生成」并做幂等去重。锚点由客户端计算，强制覆盖
++                    // 模型可能自行传入的同名参数；generationId 在本次生成
++                    // 内只算一次，所有工具调用共享。
++                    val memoryWriteContext = buildMemoryWriteContext(
++                        conversation = conversation,
++                        messageRange = messageRange,
++                    )
+                     mcpManager.getAllAvailableTools().also { allTools ->
+                         val invalidNames = allTools
+                             .map { it.second }
+@@ -564,6 +575,13 @@ class ChatService(
+                             return
+                         }
+                     }.forEach { (serverId, serverName, tool) ->
++                        // 仅对显式开启 memoryWriteContextInjection 的 MCP Server
++                        // 注入（不凭显示名/URL 猜测，避免误注入普通 Server）。
++                        val injectionEnabled = settings.mcpServers
++                            .firstOrNull { it.id == serverId }
++                            ?.commonOptions
++                            ?.memoryWriteContextInjection
++                            ?: false
+                         add(
+                             Tool(
+                                 name = "mcp__${serverName}__${tool.name}",
+@@ -571,7 +589,13 @@ class ChatService(
+                                 parameters = { tool.inputSchema },
+                                 needsApproval = { tool.needsApproval },
+                                 execute = {
+-                                    mcpManager.callTool(serverId, tool.name, it.jsonObject)
++                                    val args = injectMemoryWriteContext(
++                                        raw = it.jsonObject,
++                                        toolName = tool.name,
++                                        context = memoryWriteContext,
++                                        injectionEnabled = injectionEnabled,
++                                    )
++                                    mcpManager.callTool(serverId, tool.name, args)
+                                 },
+                             )
+                         )
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/mcp/MemoryWriteContextTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/mcp/MemoryWriteContextTest.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..eeacf6507d9d67339c432ec8a29f7b829b45f9bb
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/mcp/MemoryWriteContextTest.kt
+@@ -0,0 +1,193 @@
++package me.rerere.rikkahub.data.ai.mcp
++
++import kotlinx.serialization.json.JsonObject
++import kotlinx.serialization.json.buildJsonObject
++import kotlinx.serialization.json.put
++import me.rerere.ai.core.MessageRole
++import me.rerere.ai.ui.UIMessage
++import me.rerere.ai.ui.UIMessagePart
++import me.rerere.rikkahub.data.model.Conversation
++import me.rerere.rikkahub.data.model.MessageNode
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import kotlin.uuid.Uuid
++
++class MemoryWriteContextTest {
++
++    private fun user(text: String) = UIMessage(
++        role = MessageRole.USER,
++        parts = listOf(UIMessagePart.Text(text)),
++    )
++
++    private fun assistant(text: String) = UIMessage(
++        role = MessageRole.ASSISTANT,
++        parts = listOf(UIMessagePart.Text(text)),
++    )
++
++    private fun conversation(vararg nodes: MessageNode): Conversation {
++        return Conversation(
++            id = Uuid.random(),
++            assistantId = Uuid.random(),
++            messageNodes = nodes.toList(),
++            title = "test",
++        )
++    }
++
++    private fun nodeOf(vararg messages: UIMessage): MessageNode {
++        return MessageNode(messages = messages.toList())
++    }
++
++    // ------------------------------------------------------------
++    // anchor 解析
++    // ------------------------------------------------------------
++    @Test
++    fun `normal message anchors to last user node`() {
++        val conv = conversation(
++            nodeOf(user("你好")),
++            nodeOf(assistant("你好呀")),
++            nodeOf(user("今天考试")),
++        )
++        val anchor = resolveAnchorNodeId(conv, null)
++        assertNotNull(anchor)
++        assertEquals(conv.messageNodes[2].id, anchor)
++    }
++
++    @Test
++    fun `assistant reroll anchors to preceding user node`() {
++        val conv = conversation(
++            nodeOf(user("第一次提问")),
++            nodeOf(assistant("第一次回答"), assistant("第二次回答")),
++            nodeOf(assistant("后续消息")),
++        )
++        val anchor = resolveAnchorNodeId(conv, 0 until 2)
++        assertNotNull(anchor)
++        assertEquals(conv.messageNodes[0].id, anchor)
++    }
++
++    @Test
++    fun `user reroll anchors to the truncated user node`() {
++        val conv = conversation(
++            nodeOf(user("原始提问")),
++        )
++        val anchor = resolveAnchorNodeId(conv, null)
++        assertEquals(conv.messageNodes[0].id, anchor)
++    }
++
++    @Test
++    fun `no user node yields null anchor`() {
++        val conv = conversation(nodeOf(assistant("孤儿回复")))
++        assertNull(resolveAnchorNodeId(conv, null))
++    }
++
++    // ------------------------------------------------------------
++    // reroll 代数
++    // ------------------------------------------------------------
++    @Test
++    fun `reroll generation counts existing branches`() {
++        val conv = conversation(
++            nodeOf(user("提问")),
++            nodeOf(assistant("回答一"), assistant("回答二"), assistant("回答三")),
++        )
++        val generation = resolveRerollGeneration(conv, 0 until 1)
++        assertEquals(3, generation)
++    }
++
++    @Test
++    fun `normal message has reroll generation zero`() {
++        val conv = conversation(nodeOf(user("提问")))
++        assertEquals(0, resolveRerollGeneration(conv, null))
++    }
++
++    // ------------------------------------------------------------
++    // 上下文构建
++    // ------------------------------------------------------------
++    @Test
++    fun `build context carries stable conversation and anchor`() {
++        val conv = conversation(
++            nodeOf(user("提问")),
++            nodeOf(assistant("回答")),
++        )
++        val ctx = buildMemoryWriteContext(conv, 0 until 1)
++        assertNotNull(ctx)
++        ctx!!
++        assertEquals("rikkahub", ctx.client)
++        assertEquals(conv.id.toString(), ctx.conversationId)
++        assertEquals(conv.messageNodes[0].id.toString(), ctx.anchorNodeId)
++        assertTrue(ctx.generationId.isNotBlank())
++        assertEquals(0, ctx.rerollGeneration)
++    }
++
++    // ------------------------------------------------------------
++    // 注入
++    // ------------------------------------------------------------
++    @Test
++    fun `injects only into write tools when injection enabled`() {
++        val ctx = MemoryWriteContext(
++            client = "rikkahub",
++            conversationId = "11111111-1111-4111-8111-111111111111",
++            anchorNodeId = "22222222-2222-4222-8222-222222222222",
++            generationId = "33333333-3333-4333-8333-333333333333",
++            rerollGeneration = 2,
++        )
++        val raw = buildJsonObject {
++            put("content", "测试内容")
++        }
++
++        // 开启注入：服务端已接入 receipt 幂等的 hold/grow 才会注入；
++        // plan/letter_write 尚未定义服务端复用语义，必须保持原样。
++        assertTrue("client_write_context" in injectMemoryWriteContext(raw, "hold", ctx, injectionEnabled = true))
++        assertTrue("client_write_context" in injectMemoryWriteContext(raw, "grow", ctx, injectionEnabled = true))
++        assertFalse("client_write_context" in injectMemoryWriteContext(raw, "plan", ctx, injectionEnabled = true))
++        assertFalse("client_write_context" in injectMemoryWriteContext(raw, "letter_write", ctx, injectionEnabled = true))
++        // 只读工具不注入
++        assertFalse("client_write_context" in injectMemoryWriteContext(raw, "breath", ctx, injectionEnabled = true))
++        assertFalse("client_write_context" in injectMemoryWriteContext(raw, "breath_search", ctx, injectionEnabled = true))
++        assertFalse("client_write_context" in injectMemoryWriteContext(raw, "pulse", ctx, injectionEnabled = true))
++        // 未显式开启注入的 Server：即使工具名匹配也不注入
++        assertFalse("client_write_context" in injectMemoryWriteContext(raw, "hold", ctx, injectionEnabled = false))
++        // 没有锚点（context = null）：原样透传
++        assertFalse("client_write_context" in injectMemoryWriteContext(raw, "hold", null, injectionEnabled = true))
++    }
++
++    @Test
++    fun `injection overrides model supplied context`() {
++        val ctx = MemoryWriteContext(
++            client = "rikkahub",
++            conversationId = "11111111-1111-4111-8111-111111111111",
++            anchorNodeId = "22222222-2222-4222-8222-222222222222",
++            generationId = "33333333-3333-4333-8333-333333333333",
++            rerollGeneration = 2,
++        )
++        val modelSpoofed = buildJsonObject {
++            put("client_write_context", buildJsonObject {
++                put("client", "evil")
++                put("conversation_id", "00000000-0000-4000-8000-000000000000")
++            })
++        }
++        val injected = injectMemoryWriteContext(modelSpoofed, "hold", ctx, injectionEnabled = true)
++        val injectedCtx = injected["client_write_context"] as JsonObject
++        assertEquals("rikkahub", injectedCtx["client"]!!.toString().trim('"'))
++        assertEquals(
++            "11111111-1111-4111-8111-111111111111",
++            injectedCtx["conversation_id"]!!.toString().trim('"'),
++        )
++    }
++
++    @Test
++    fun `injection requires explicit config enable`() {
++        val ctx = MemoryWriteContext(
++            client = "rikkahub",
++            conversationId = "11111111-1111-4111-8111-111111111111",
++            anchorNodeId = "22222222-2222-4222-8222-222222222222",
++            generationId = "33333333-3333-4333-8333-333333333333",
++            rerollGeneration = 0,
++        )
++        val raw = buildJsonObject { put("content", "x") }
++        // 默认关闭：不凭显示名/URL 猜测，未显式开启一律不注入
++        assertFalse("client_write_context" in injectMemoryWriteContext(raw, "hold", ctx, injectionEnabled = false))
++    }
++}

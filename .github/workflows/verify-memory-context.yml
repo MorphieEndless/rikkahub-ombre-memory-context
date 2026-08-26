@@ -9,13 +9,31 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # 上传 APK artifact 需要
+      contents: write
 
     steps:
+      # 1) 检出本仓库（含补丁文件）
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          submodules: recursive   # 拉取 material-color-utilities 子模块
+
+      # 2) 检出官方 RikkaHub 源码（master，含子模块）
+      - uses: actions/checkout@v4
+        with:
+          repository: rikkahub/rikkahub
+          ref: master
+          path: upstream
+          fetch-depth: 1
+          submodules: recursive
+
+      # 3) 应用补丁（在官方源码上）
+      - name: Apply MemoryWriteContext patch
+        working-directory: upstream
+        run: |
+          git apply --check $GITHUB_WORKSPACE/rikkahub-memory-context.patch
+          git apply $GITHUB_WORKSPACE/rikkahub-memory-context.patch
+          echo "=== 补丁应用后新增/修改的文件 ==="
+          git status --short
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -23,7 +41,7 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      # web 模块 preBuild 会执行 pnpm build，必须准备 Node + pnpm
+      # web 模块 preBuild 需要 pnpm build
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
         with:
@@ -34,10 +52,10 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-          cache-dependency-path: web-ui/pnpm-lock.yaml
+          cache-dependency-path: upstream/web-ui/pnpm-lock.yaml
 
       - name: Install web-ui dependencies
-        working-directory: web-ui
+        working-directory: upstream/web-ui
         run: pnpm install --frozen-lockfile
 
       - name: Gradle cache
@@ -48,21 +66,19 @@ jobs:
             ~/.gradle/wrapper
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
 
-      # 签名/Google 服务文件是 release 才需要，debug 不需要，留空占位避免任务失败
-      - name: Prepare build files (debug placeholders)
-        run: |
-          echo "{}" > app/google-services.json 2>/dev/null || true
-
       - name: Compile debug Kotlin (验证补丁可编译)
+        working-directory: upstream
         run: |
           chmod +x gradlew
           ./gradlew :app:compileDebugKotlin --no-daemon
 
       - name: Run MemoryWriteContextTest (12 scenarios)
+        working-directory: upstream
         run: |
           ./gradlew :app:testDebugUnitTest --tests "me.rerere.rikkahub.data.ai.mcp.MemoryWriteContextTest" --no-daemon
 
       - name: Assemble debug APK
+        working-directory: upstream
         run: |
           ./gradlew :app:assembleDebug --no-daemon
 
@@ -70,5 +86,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rikkahub-ombre-memory-context-debug
-          path: app/build/outputs/apk/debug/*.apk
+          path: upstream/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
