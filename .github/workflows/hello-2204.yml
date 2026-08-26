@@ -1,0 +1,12 @@
+name: Hello Test 2204
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  hello:
+    runs-on: ubuntu-22.04
+    steps:
+      - run: echo "hello from 2204 runner"
+      - run: uname -a
