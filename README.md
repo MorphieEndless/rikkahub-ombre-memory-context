@@ -17,6 +17,10 @@ RikkaHub 以「单条对话为截止点 reroll」时，上一分支已执行的 
 
 push 到 main 或手动 workflow_dispatch 触发。Actions 会在官方源码上打补丁并完整编译验证。
 
+## 验证记录
+
+- 2026-08-26：workflow v2（官方源码 + apply 补丁方案）就绪，等待首次运行。
+
 ## 设计原则
 
 - 默认关闭：不凭显示名/URL 猜测，必须由用户在 MCP Server 配置中显式开启 `memoryWriteContextInjection`
